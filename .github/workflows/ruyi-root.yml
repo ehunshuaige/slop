@@ -1,12 +1,14 @@
-name: iOS 16 root image (HFS+)
+name: iOS 16 root image (HFS+, RAM-sized)
 
-# Build the HFS+ root filesystem that XNU boots (rd=ufsroot0 on real UFS, or
-# rd=md0 from a RAM disk).
+# Build the HFS+ root that XNU mounts as rd=md0 from a DarwinBoot RAM disk.
 #
-# A GitHub runner has real root and the hfsplus kernel module, so it can mount
-# and populate the image the way tools/mkiosroot.sh expects. apfs-fuse is not in
-# the Ubuntu archive, so it is built here from source (it needs fuse3 headers
-# only at link time for the FUSE front-end; mkiosroot.sh just needs the binary).
+# Two hard limits shape this:
+#   * DarwinBoot's packed-ramdisk parser accepts at most 256 MiB, but its
+#     multi-part initrd path streams into the window instead, so the parts may be
+#     large as long as their total fits the window.
+#   * The window is capped at 8 GiB (WindowSize.h), and the phone has 12 GB.
+# The full 16 GiB volume with every localisation does not fit, so the tree is
+# trimmed to what the lock screen and SpringBoard need (see tools/root-trim.py).
 
 on:
   workflow_dispatch:
@@ -16,9 +18,9 @@ on:
         required: true
         default: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
       size_gib:
-        description: HFS+ image size in GiB
+        description: HFS+ volume size in GiB (must exceed the trimmed tree)
         required: false
-        default: "16"
+        default: "8"
 
 jobs:
   build:
@@ -43,7 +45,6 @@ jobs:
           cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release -DUSE_FUSE3=ON
           cmake --build /tmp/apfs-fuse/build --target apfs-fuse -j"$(nproc)"
           sudo install -m755 /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
-          apfs-fuse 2>&1 | head -3 || true
 
       - name: Fetch the IPSW members
         run: |
@@ -55,14 +56,12 @@ jobs:
           rm -f restore.ipsw
           ls -l
 
-      - name: Build the HFS+ root
+      - name: Build the full HFS+ root
         run: |
           set -euo pipefail
           cd work
           bash ../tools/mkiosroot.sh dmgs/087-86698-044.dmg dmgs/087-86593-047.dmg \
-               dmgs/087-86715-047.dmg ios16-root.img "${{ inputs.size_gib }}G" 2>&1 | tail -80
-          ls -l ios16-root.img
-          sudo chown "$USER:" ios16-root.img
+               dmgs/087-86715-047.dmg ios16-root.img "${{ inputs.size_gib }}G" 2>&1 | tail -40
 
       - name: Apply the bring-up changes
         run: |
@@ -70,25 +69,27 @@ jobs:
           cd work
           mkdir -p mnt
           sudo mount -t hfsplus -o loop,force,rw ios16-root.img mnt
-          sudo python3 ../tools/sweet-root-tweaks.py "$PWD/mnt" 2>&1 | tail -40 || true
+          sudo python3 ../tools/sweet-root-tweaks.py "$PWD/mnt" 2>&1 | tail -30 || true
+          echo "== before trim =="
+          sudo du -sh mnt
+          sudo python3 ../tools/root-trim.py mnt 2>&1 | tail -30
+          echo "== after trim =="
+          sudo du -sh mnt
           sudo umount mnt
-          fsck.hfsplus -f -n ios16-root.img | tail -6 || true
 
-      - name: Split for the artifact limit
+      - name: Report the image
         run: |
           set -euo pipefail
           cd work
           ls -l ios16-root.img
           sha256sum ios16-root.img | tee ios16-root.img.sha256
-          # GitHub artifacts cap each file at 2 GiB after compression, and the
-          # image is mostly free space: split into 1 GiB parts.
           split -b 1G -d --suffix-length=2 ios16-root.img ios16-root.img.part
           ls -l ios16-root.img.part*
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios16-root
+          name: ios16-root-trimmed
           path: |
             work/ios16-root.img.part*
             work/ios16-root.img.sha256
