@@ -1,106 +1,112 @@
-name: iOS 16 root image (HFS+, RAM-sized)
+name: iOS 16 root image (HFS+)
 
-# Build the HFS+ root that XNU mounts as rd=md0 from a DarwinBoot RAM disk.
+# Build the HFS+ root that XNU mounts, from the pre-extracted iPhone X 16.7.16
+# tree published on this repository's ios16-rootfs-20H392 release.
 #
-# Two hard limits shape this:
-#   * DarwinBoot's packed-ramdisk parser accepts at most 256 MiB; its multi-part
-#     initrd path streams into the window instead, so the parts may be large as
-#     long as their total fits the window.
-#   * The window is capped at 8 GiB (WindowSize.h) and the phone has 12 GB.
-# The full volume (5.6 GiB of OS plus a 3.2 GiB cryptex) is far too big, so the
-# OS tree is trimmed before it is copied into the volume: mkiosroot.sh would need
-# room for both the untrimmed copy and the cryptexes otherwise.
+# Why a release instead of extracting here: the OS disk image is APFS with
+# LZBITMAP-compressed files, which neither libfsapfs nor apfs-fuse reads
+# correctly for every file, and the extracted tree is 3.7 GiB after trimming.
+# Extracting once and publishing the result keeps this workflow to the part that
+# needs real root: mkfs/mount/rsync into an HFS+ volume.
 
 on:
   workflow_dispatch:
     inputs:
-      ipsw_url:
-        description: IPSW URL to pull the three disk images from
-        required: true
-        default: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
       size_gib:
         description: HFS+ volume size in GiB
         required: false
         default: "8"
 
+env:
+  RELEASE: ios16-rootfs-20H392
+
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 240
+    timeout-minutes: 180
     steps:
       - uses: actions/checkout@v4
 
       - name: Install host tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends \
-            build-essential cmake libfuse3-dev libicu-dev libssl-dev \
-            libbz2-dev zlib1g-dev libattr1-dev hfsprogs rsync p7zip-full mtools python3 curl unzip
+          sudo apt-get install -y --no-install-recommends hfsprogs rsync ca-certificates curl
           sudo modprobe hfsplus || true
-          which mkfs.hfsplus fsck.hfsplus rsync cmake
+          which mkfs.hfsplus fsck.hfsplus rsync
 
-      - name: Build apfs-fuse
+      - name: Fetch the extracted root tree
         run: |
           set -euo pipefail
-          git clone --depth 1 --recurse-submodules https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
-          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release -DUSE_FUSE3=ON
-          cmake --build /tmp/apfs-fuse/build --target apfs-fuse -j"$(nproc)"
-          sudo install -m755 /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
+          mkdir -p work
+          cd work
+          base="https://github.com/${{ github.repository }}/releases/download/${RELEASE}"
+          curl -fL --retry 3 -o rootfs.part00 "$base/rootfs.tar.gz.part00"
+          curl -fL --retry 3 -o rootfs.part01 "$base/rootfs.tar.gz.part01"
+          cat rootfs.part00 rootfs.part01 > rootfs.tar.gz
+          rm -f rootfs.part00 rootfs.part01
+          ls -l rootfs.tar.gz
+          mkdir -p tree
+          tar -C tree -xzf rootfs.tar.gz
+          du -sh tree/os-trimmed tree/sysos-root tree/appos-root
 
-      - name: Fetch the IPSW members
-        run: |
-          set -euo pipefail
-          mkdir -p work/dmgs
-          cd work/dmgs
-          curl -fL --retry 3 -o restore.ipsw "${{ inputs.ipsw_url }}"
-          unzip -o -q restore.ipsw "087-86698-044.dmg" "087-86593-047.dmg" "087-86715-047.dmg"
-          rm -f restore.ipsw
-          ls -l
-
-      - name: Extract and trim the OS tree
+      - name: Build the HFS+ volume
         run: |
           set -euo pipefail
           cd work
-          mkdir -p os-root
-          apfs-fuse dmgs/087-86698-044.dmg "$PWD/os-root" &
-          for _ in $(seq 1 60); do sleep 2; [ -d os-root/root/System ] && break; done
-          du -sh os-root/root
-          python3 ../tools/root-trim.py os-root/root 2>&1 | tail -10
-          du -sh os-root/root
-          # Repack the trimmed tree into a plain tar so mkiosroot.sh sees a small
-          # source directory and the volume only has to hold the result.
-          tar -C os-root/root -cf os-trimmed.tar .
-          ls -l os-trimmed.tar
-          fusermount3 -u "$PWD/os-root" 2>/dev/null || fusermount -u "$PWD/os-root" 2>/dev/null || true
+          out=ios16-root.img
+          truncate -s "${{ inputs.size_gib }}G" "$out"
+          mkfs.hfsplus -s -J -v iOSRoot "$out"
+          mkdir -p mnt
+          sudo mount -t hfsplus -o loop,force,rw "$out" mnt
+          # mkiosroot.sh's layout: OS root at /, the cryptexes under
+          # /private/preboot/Cryptexes as on a restored device.
+          sudo mkdir -p mnt/private/preboot/Cryptexes/OS mnt/private/preboot/Cryptexes/App
+          sudo rsync -aH --numeric-ids tree/os-trimmed/ mnt/
+          sudo rsync -aH --numeric-ids tree/sysos-root/ mnt/private/preboot/Cryptexes/OS/
+          sudo rsync -aH --numeric-ids tree/appos-root/ mnt/private/preboot/Cryptexes/App/
+          echo "== filled =="
+          sudo du -sh mnt
+          df -h mnt
+          # The shared cache must be reachable where dyld looks at ignition level 1.
+          sudo mkdir -p mnt/System/Library/Caches/com.apple.dyld
+          for f in mnt/private/preboot/Cryptexes/OS/System/Library/Caches/com.apple.dyld/*; do
+            [ -e "$f" ] || continue
+            sudo ln -f "$f" "mnt/System/Library/Caches/com.apple.dyld/$(basename "$f")" 2>/dev/null || sudo cp -P "$f" "mnt/System/Library/Caches/com.apple.dyld/"
+          done
+          # logd expects its stores with _logd ownership and the migrated marker.
+          db=mnt/private/var/db
+          sudo mkdir -p "$db/diagnostics/timesync" "$db/uuidtext"
+          for d in diagnostics uuidtext diagnostics/timesync; do
+            sudo touch "$db/$d/.migrated"
+            sudo chown 272:272 "$db/$d" "$db/$d/.migrated"
+            sudo chmod 0644 "$db/$d/.migrated"
+          done
+          sudo chmod 0751 "$db/diagnostics"
+          sudo chmod 0755 "$db/uuidtext" "$db/diagnostics/timesync"
+          # Plain-plist system keybag for the built-in AppleKeyStore.
+          kb=mnt/private/var/keybags
+          sudo mkdir -p "$kb"; sudo chown 0:0 "$kb"; sudo chmod 0700 "$kb"
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' \
+            '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict><key>KeyBagKeys</key><data>U1dFRVQ=</data></dict></plist>' |
+            sudo tee "$kb/systembag.kb" >/dev/null
+          sudo chown 0:0 "$kb/systembag.kb"; sudo chmod 0600 "$kb/systembag.kb"
+          sudo umount mnt
 
-      - name: Build the HFS+ root
-        run: |
-          set -euo pipefail
-          cd work
-          mkdir -p trimmed
-          tar -C trimmed -xf os-trimmed.tar
-          du -sh trimmed
-          # mkiosroot.sh copies a root tree plus both cryptexes; feed it the
-          # already-trimmed tree by making a fake "os" tree around it.
-          mkdir -p fakedmg/root
-          cp -a trimmed/. fakedmg/root/
-          bash ../tools/mkiosroot.sh "$PWD/fakedmg" dmgs/087-86593-047.dmg \
-               dmgs/087-86715-047.dmg ios16-root.img "${{ inputs.size_gib }}G" 2>&1 | tail -40
-
-      - name: Verify the image
+      - name: Verify and split
         run: |
           set -euo pipefail
           cd work
           ls -l ios16-root.img
           fsck.hfsplus -f -n ios16-root.img | tail -8 || true
           sha256sum ios16-root.img | tee ios16-root.img.sha256
-          split -b 1G -d --suffix-length=2 ios16-root.img ios16-root.img.part
+          split -b 1500M -d --suffix-length=2 ios16-root.img ios16-root.img.part
           ls -l ios16-root.img.part*
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: ios16-root-trimmed
+          name: ios16-root
           path: |
             work/ios16-root.img.part*
             work/ios16-root.img.sha256
