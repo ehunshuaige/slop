@@ -3,12 +3,13 @@ name: iOS 16 root image (HFS+, RAM-sized)
 # Build the HFS+ root that XNU mounts as rd=md0 from a DarwinBoot RAM disk.
 #
 # Two hard limits shape this:
-#   * DarwinBoot's packed-ramdisk parser accepts at most 256 MiB, but its
-#     multi-part initrd path streams into the window instead, so the parts may be
-#     large as long as their total fits the window.
-#   * The window is capped at 8 GiB (WindowSize.h), and the phone has 12 GB.
-# The full 16 GiB volume with every localisation does not fit, so the tree is
-# trimmed to what the lock screen and SpringBoard need (see tools/root-trim.py).
+#   * DarwinBoot's packed-ramdisk parser accepts at most 256 MiB; its multi-part
+#     initrd path streams into the window instead, so the parts may be large as
+#     long as their total fits the window.
+#   * The window is capped at 8 GiB (WindowSize.h) and the phone has 12 GB.
+# The full volume (5.6 GiB of OS plus a 3.2 GiB cryptex) is far too big, so the
+# OS tree is trimmed before it is copied into the volume: mkiosroot.sh would need
+# room for both the untrimmed copy and the cryptexes otherwise.
 
 on:
   workflow_dispatch:
@@ -18,7 +19,7 @@ on:
         required: true
         default: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
       size_gib:
-        description: HFS+ volume size in GiB (must exceed the trimmed tree)
+        description: HFS+ volume size in GiB
         required: false
         default: "8"
 
@@ -56,32 +57,42 @@ jobs:
           rm -f restore.ipsw
           ls -l
 
-      - name: Build the full HFS+ root
+      - name: Extract and trim the OS tree
         run: |
           set -euo pipefail
           cd work
-          bash ../tools/mkiosroot.sh dmgs/087-86698-044.dmg dmgs/087-86593-047.dmg \
+          mkdir -p os-root
+          apfs-fuse dmgs/087-86698-044.dmg "$PWD/os-root" &
+          for _ in $(seq 1 60); do sleep 2; [ -d os-root/root/System ] && break; done
+          du -sh os-root/root
+          python3 ../tools/root-trim.py os-root/root 2>&1 | tail -10
+          du -sh os-root/root
+          # Repack the trimmed tree into a plain tar so mkiosroot.sh sees a small
+          # source directory and the volume only has to hold the result.
+          tar -C os-root/root -cf os-trimmed.tar .
+          ls -l os-trimmed.tar
+          fusermount3 -u "$PWD/os-root" 2>/dev/null || fusermount -u "$PWD/os-root" 2>/dev/null || true
+
+      - name: Build the HFS+ root
+        run: |
+          set -euo pipefail
+          cd work
+          mkdir -p trimmed
+          tar -C trimmed -xf os-trimmed.tar
+          du -sh trimmed
+          # mkiosroot.sh copies a root tree plus both cryptexes; feed it the
+          # already-trimmed tree by making a fake "os" tree around it.
+          mkdir -p fakedmg/root
+          cp -a trimmed/. fakedmg/root/
+          bash ../tools/mkiosroot.sh "$PWD/fakedmg" dmgs/087-86593-047.dmg \
                dmgs/087-86715-047.dmg ios16-root.img "${{ inputs.size_gib }}G" 2>&1 | tail -40
 
-      - name: Apply the bring-up changes
-        run: |
-          set -euo pipefail
-          cd work
-          mkdir -p mnt
-          sudo mount -t hfsplus -o loop,force,rw ios16-root.img mnt
-          sudo python3 ../tools/sweet-root-tweaks.py "$PWD/mnt" 2>&1 | tail -30 || true
-          echo "== before trim =="
-          sudo du -sh mnt
-          sudo python3 ../tools/root-trim.py mnt 2>&1 | tail -30
-          echo "== after trim =="
-          sudo du -sh mnt
-          sudo umount mnt
-
-      - name: Report the image
+      - name: Verify the image
         run: |
           set -euo pipefail
           cd work
           ls -l ios16-root.img
+          fsck.hfsplus -f -n ios16-root.img | tail -8 || true
           sha256sum ios16-root.img | tee ios16-root.img.sha256
           split -b 1G -d --suffix-length=2 ios16-root.img ios16-root.img.part
           ls -l ios16-root.img.part*
