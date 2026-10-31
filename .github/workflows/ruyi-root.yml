@@ -1,34 +1,20 @@
 name: iOS 16 root image (HFS+)
 
-# Build the HFS+ root filesystem that XNU boots as rd=ufsroot0 / rd=md0.
+# Build the HFS+ root filesystem that XNU boots (rd=ufsroot0 on real UFS, or
+# rd=md0 from a RAM disk).
 #
 # A GitHub runner has real root and the hfsplus kernel module, so it can mount
-# and populate the image the way tools/mkiosroot.sh expects. Doing this on a
-# workstation needs sudo; this workflow makes the artifact reproducible.
-#
-# Inputs are the three IPSW disk images and the two cryptexes, which are Apple
-# material and must not be committed. They come from a previous run's artifact or
-# from a URL supplied per dispatch.
+# and populate the image the way tools/mkiosroot.sh expects. apfs-fuse is not in
+# the Ubuntu archive, so it is built here from source (it needs fuse3 headers
+# only at link time for the FUSE front-end; mkiosroot.sh just needs the binary).
 
 on:
   workflow_dispatch:
     inputs:
-      os_dmg_url:
-        description: OS disk image URL (087-86698-044.dmg)
-        required: false
-        default: ""
-      sysos_dmg_url:
-        description: SystemOS cryptex URL (087-86593-047.dmg)
-        required: false
-        default: ""
-      appos_dmg_url:
-        description: AppOS cryptex URL (087-86715-047.dmg)
-        required: false
-        default: ""
       ipsw_url:
-        description: IPSW URL to pull the three images from
-        required: false
-        default: ""
+        description: IPSW URL to pull the three disk images from
+        required: true
+        default: https://updates.cdn-apple.com/2025FallFCS/fullrestores/122-77006/1158E502-D76D-4226-AA06-ED5E30CD1111/iPhone10,3,iPhone10,6_16.7.16_20H392_Restore.ipsw
       size_gib:
         description: HFS+ image size in GiB
         required: false
@@ -37,7 +23,7 @@ on:
 jobs:
   build:
     runs-on: ubuntu-24.04
-    timeout-minutes: 180
+    timeout-minutes: 240
     steps:
       - uses: actions/checkout@v4
 
@@ -45,35 +31,36 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            apfs-fuse hfsprogs rsync p7zip-full mtools python3
+            build-essential cmake libfuse3-dev libicu-dev libssl-dev \
+            libbz2-dev zlib1g-dev libattr1-dev hfsprogs rsync p7zip-full mtools python3 curl unzip
           sudo modprobe hfsplus || true
-          ls /dev/loop* | head -3
-          which apfs-fuse mkfs.hfsplus fsck.hfsplus rsync
+          which mkfs.hfsplus fsck.hfsplus rsync cmake
+
+      - name: Build apfs-fuse
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --recurse-submodules https://github.com/sgan81/apfs-fuse.git /tmp/apfs-fuse
+          cmake -S /tmp/apfs-fuse -B /tmp/apfs-fuse/build -DCMAKE_BUILD_TYPE=Release -DUSE_FUSE3=ON
+          cmake --build /tmp/apfs-fuse/build --target apfs-fuse -j"$(nproc)"
+          sudo install -m755 /tmp/apfs-fuse/build/apfs-fuse /usr/local/bin/apfs-fuse
+          apfs-fuse 2>&1 | head -3 || true
 
       - name: Fetch the IPSW members
         run: |
           set -euo pipefail
           mkdir -p work/dmgs
           cd work/dmgs
-          if [ -n "${{ inputs.ipsw_url }}" ]; then
-            curl -fL --retry 3 -o restore.ipsw "${{ inputs.ipsw_url }}"
-            unzip -o -q restore.ipsw "087-86698-044.dmg" "087-86593-047.dmg" "087-86715-047.dmg"
-            rm -f restore.ipsw
-          fi
-          for pair in "os_dmg_url:087-86698-044.dmg" "sysos_dmg_url:087-86593-047.dmg" "appos_dmg_url:087-86715-047.dmg"; do
-            key=${pair%%:*}; name=${pair##*:}
-            url="$(python3 -c "import json,os;print(json.load(open(os.environ['GITHUB_EVENT_PATH']))['inputs'].get('$key') or '')")"
-            [ -n "$url" ] && curl -fL --retry 3 -o "$name" "$url"
-            printf '%-24s %s\n' "$name" "$(ls -l "$name" 2>/dev/null | awk '{print $5}' || echo MISSING)"
-          done
-          du -sh .
+          curl -fL --retry 3 -o restore.ipsw "${{ inputs.ipsw_url }}"
+          unzip -o -q restore.ipsw "087-86698-044.dmg" "087-86593-047.dmg" "087-86715-047.dmg"
+          rm -f restore.ipsw
+          ls -l
 
       - name: Build the HFS+ root
         run: |
           set -euo pipefail
           cd work
           bash ../tools/mkiosroot.sh dmgs/087-86698-044.dmg dmgs/087-86593-047.dmg \
-               dmgs/087-86715-047.dmg ios16-root.img "${{ inputs.size_gib }}G" 2>&1 | tail -60
+               dmgs/087-86715-047.dmg ios16-root.img "${{ inputs.size_gib }}G" 2>&1 | tail -80
           ls -l ios16-root.img
           sudo chown "$USER:" ios16-root.img
 
@@ -83,25 +70,28 @@ jobs:
           cd work
           mkdir -p mnt
           sudo mount -t hfsplus -o loop,force,rw ios16-root.img mnt
-          sudo python3 ../tools/sweet-root-tweaks.py "$PWD/mnt" 2>&1 | tail -30 || true
+          sudo python3 ../tools/sweet-root-tweaks.py "$PWD/mnt" 2>&1 | tail -40 || true
           sudo umount mnt
-          fsck.hfsplus -f -n ios16-root.img | tail -5 || true
+          fsck.hfsplus -f -n ios16-root.img | tail -6 || true
 
-      - name: Report the image
+      - name: Split for the artifact limit
         run: |
+          set -euo pipefail
           cd work
           ls -l ios16-root.img
-          sha256sum ios16-root.img
-          # img2simg keeps the fastboot sparse limit happy
-          (command -v img2simg >/dev/null && img2simg ios16-root.img ios16-root.simg && ls -l ios16-root.simg) || echo "img2simg absent"
+          sha256sum ios16-root.img | tee ios16-root.img.sha256
+          # GitHub artifacts cap each file at 2 GiB after compression, and the
+          # image is mostly free space: split into 1 GiB parts.
+          split -b 1G -d --suffix-length=2 ios16-root.img ios16-root.img.part
+          ls -l ios16-root.img.part*
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
           name: ios16-root
           path: |
-            work/ios16-root.img
-            work/ios16-root.simg
+            work/ios16-root.img.part*
+            work/ios16-root.img.sha256
           if-no-files-found: warn
           retention-days: 7
-          compression-level: 0
+          compression-level: 6
